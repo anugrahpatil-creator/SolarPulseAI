@@ -158,6 +158,21 @@ async def seed() -> None:
         # ── 3. Demo Plants ────────────────────────────────────────────────────
         now = datetime.now(tz=timezone.utc).replace(minute=0, second=0, microsecond=0)
 
+        # Remove any plants that are NOT in the current DEMO_PLANTS list.
+        # This handles stale data from previous seeds (e.g. the old 7 extra plants).
+        canonical_names = set()
+        for pd_entry in DEMO_PLANTS:
+            canonical_names.add(pd_entry["name"])
+            canonical_names.add(pd_entry["name"].replace(" - ", " – "))
+            canonical_names.add(pd_entry["name"].replace(" – ", " - "))
+
+        all_plants = (await session.execute(select(Plant))).scalars().all()
+        for stale in all_plants:
+            if stale.name not in canonical_names:
+                logger.info(f"  Removing stale plant [{stale.id}]: {stale.name}")
+                await session.delete(stale)
+        await session.flush()
+
         for idx, pd in enumerate(DEMO_PLANTS):
             plant = await session.scalar(
                 select(Plant).where(
