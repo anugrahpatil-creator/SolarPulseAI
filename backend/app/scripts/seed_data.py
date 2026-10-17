@@ -16,8 +16,10 @@ Usage:
 """
 
 import asyncio
+import json
 import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import delete, select
 
@@ -216,32 +218,82 @@ async def seed() -> None:
                 delete(ForecastRecord).where(ForecastRecord.plant_id == plant.id)
             )
             peak_kw = pd["peak_gen_kw"]
+            # Plant-specific adaptation parameters:
+            # Plant 1 (Bhadla): Desert dust/soiling (gamma ~ 0.942, -5.8% scaling)
+            # Plant 2 (Pavagada): Haze & aerosol damping (gamma ~ 0.931, -6.9% scaling)
+            # Plant 3 (Kamuthi): Mild coastal humidity damping (gamma ~ 0.954, -4.6% scaling)
+            gamma = 0.942 - idx * 0.008
             fc_batch = []
             for i in range(-24, 25):
                 t = now + timedelta(hours=i)
                 hour_val = t.hour + t.minute / 60.0
                 pred = generate_diurnal_power(hour_val, peak_kw)
-                noise = math.sin(i * 1.5 + idx) * peak_kw * 0.018
+
+                # Base model (ml_power_kw): frozen Tier-1 model without live adaptation
+                # Overestimates clear-sky potential because it doesn't know about live soiling/haze
+                if pred > 0:
+                    base_kw = round(pred * 1.055, 2)
+                else:
+                    base_kw = 0.0
+
+                # Adapted model (predicted_power_kw): Tier-2 online residual correction
+                # For past points (i <= 0): adapts down to match actual plant conditions
+                # For future points (i > 0): correction decays back toward base model over lead time
+                if pred > 0:
+                    if i <= 0:
+                        adapted_kw = pred
+                    else:
+                        decay = 0.88 ** i  # exponential horizon decay
+                        horizon_gamma = 1.0 + (gamma - 1.0) * decay
+                        adapted_kw = round(base_kw * horizon_gamma, 2)
+                else:
+                    adapted_kw = 0.0
+
+                noise = math.sin(i * 1.5 + idx) * peak_kw * 0.012
+                # Actual power tracks close to adapted forecast (demonstrating adapter accuracy!)
                 actual = (
-                    round(pred * 0.96 + noise, 2)
+                    round(adapted_kw * 0.985 + noise, 2)
                     if i <= 0 and pred > 0
                     else (0.0 if i <= 0 else None)
                 )
+
                 fc_batch.append(ForecastRecord(
                     plant_id=plant.id,
                     forecast_time=t,
                     generated_at=now,
-                    predicted_power_kw=pred,
+                    predicted_power_kw=adapted_kw,
                     actual_power_kw=actual,
-                    confidence_lower=round(max(0.0, pred * 0.88), 2),
-                    confidence_upper=round(pred * 1.08, 2),
+                    confidence_lower=round(max(0.0, adapted_kw * 0.88), 2),
+                    confidence_upper=round(adapted_kw * 1.08, 2),
                     model_name="SolarPulse-Hybrid-Ensemble",
                     model_version="2.1.0",
-                    physics_power_kw=round(pred * 0.98, 2),
-                    ml_power_kw=pred,
+                    physics_power_kw=round(base_kw * 0.98, 2),
+                    ml_power_kw=base_kw,
                 ))
             session.add_all(fc_batch)
             logger.info(f"    → {len(fc_batch)} forecast records (refreshed)")
+
+            # ── Online Adapter checkpoint state ──────────────────────────────
+            state_dir = Path(__file__).resolve().parent.parent.parent / "ml" / "artifacts" / "online_states"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = state_dir / f"adapter_{plant.id}.json"
+            ckpt_data = {
+                "plant_id": str(plant.id),
+                "alpha": 0.12,
+                "decay_factor": 0.90,
+                "min_scaling": 0.70,
+                "max_scaling": 1.30,
+                "state": {
+                    "plant_id": str(plant.id),
+                    "scaling_factor": round(gamma, 4),
+                    "bias_kw": round(-peak_kw * 0.018, 2),
+                    "last_updated": (now - timedelta(minutes=5)).isoformat(),
+                    "samples_observed": 18,
+                    "recent_rmse": round(peak_kw * 0.014, 2),
+                },
+            }
+            ckpt_path.write_text(json.dumps(ckpt_data, indent=2), encoding="utf-8")
+            logger.info(f"    → Online adapter checkpoint saved: {ckpt_path.name}")
 
             # ── SCADA telemetry — always refresh so timestamps stay current ──
             await session.execute(
